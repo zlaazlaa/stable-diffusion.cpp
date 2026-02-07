@@ -694,7 +694,10 @@ class CLIPTextModel : public GGMLBlock {
 protected:
     void init_params(struct ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
         if (version == OPEN_CLIP_VIT_BIGG_14) {
-            enum ggml_type wtype      = GGML_TYPE_F32;
+            enum ggml_type wtype      = GGML_TYPE_F16;
+            // NPU backend use fp16
+            // enum ggml_type wtype = get_type(prefix + "text_projection.weight", tensor_storage_map, GGML_TYPE_F32);
+            // printf("CLIPTextModel init text_projection with type %s \n", ggml_type_name(wtype));
             params["text_projection"] = ggml_new_tensor_2d(ctx, wtype, projection_dim, hidden_size);
         }
     }

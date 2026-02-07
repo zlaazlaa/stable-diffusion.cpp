@@ -48,6 +48,10 @@
 #include "ggml-sycl.h"
 #endif
 
+#ifdef SD_USE_HTP
+#include "ggml-htp.h"
+#endif
+
 #include "rng.hpp"
 #include "util.h"
 

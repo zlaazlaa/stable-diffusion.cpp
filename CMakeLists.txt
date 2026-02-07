@@ -41,11 +41,18 @@ option(SD_BUILD_SHARED_LIBS          "sd: build shared libs" OFF)
 option(SD_BUILD_SHARED_GGML_LIB      "sd: build ggml as a separate shared lib" OFF)
 option(SD_USE_SYSTEM_GGML            "sd: use system-installed GGML library" OFF)
 #option(SD_BUILD_SERVER               "sd: build server example"                           ON)
+option(SD_HTP                        "sd: htp backend" OFF)
 
 if(SD_CUDA)
     message("-- Use CUDA as backend stable-diffusion")
     set(GGML_CUDA ON)
     add_definitions(-DSD_USE_CUDA)
+endif()
+
+if(SD_HTP)
+    message("-- Use HTP as backend stable-diffusion")
+    set(GGML_HTP ON)
+    add_definitions(-DSD_USE_HTP)
 endif()
 
 if(SD_METAL)

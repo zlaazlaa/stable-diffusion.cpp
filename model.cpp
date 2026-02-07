@@ -1340,7 +1340,7 @@ std::string ModelLoader::load_umt5_tokenizer_json() {
     return json_str;
 }
 
-bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_threads_p, bool enable_mmap) {
+bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_threads_p, bool enable_mmap, tensor_filter_t filter_func) {
     int64_t process_time_ms = 0;
     std::atomic<int64_t> read_time_ms(0);
     std::atomic<int64_t> memcpy_time_ms(0);
@@ -1354,6 +1354,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 
     std::vector<TensorStorage> processed_tensor_storages;
     for (const auto& [name, tensor_storage] : tensor_storage_map) {
+        if (filter_func && !filter_func(name)) {
+            continue;
+        }
+
         if (is_unused_tensor(tensor_storage.name)) {
             continue;
         }
@@ -1673,6 +1677,59 @@ bool ModelLoader::load_tensors(std::map<std::string, struct ggml_tensor*>& tenso
         return false;
     }
     return true;
+}
+
+bool ModelLoader::load_tensors_subset(std::map<std::string, struct ggml_tensor*>& target_tensors,
+                                      int n_threads,
+                                      bool enable_mmap) {
+    auto filter_func = [&](const std::string& name) -> bool {
+        return target_tensors.find(name) != target_tensors.end();
+    };
+
+    std::set<std::string> loaded_names;
+    std::mutex tensor_names_mutex;
+
+    auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
+        const std::string& name = tensor_storage.name;
+        
+        struct ggml_tensor* real = nullptr;
+        if (target_tensors.find(name) != target_tensors.end()) {
+            real = target_tensors[name];
+        } else {
+            return true; // Skip
+        }
+
+        if (real->ne[0] != tensor_storage.ne[0] ||
+            real->ne[1] != tensor_storage.ne[1] ||
+            real->ne[2] != tensor_storage.ne[2] ||
+            real->ne[3] != tensor_storage.ne[3]) {
+            LOG_ERROR("tensor '%s' shape mismatch", name.c_str());
+            return false;
+        }
+
+        *dst_tensor = real;
+        
+        {
+            std::lock_guard<std::mutex> lock(tensor_names_mutex);
+            loaded_names.insert(name);
+        }
+        return true;
+    };
+
+    bool success = load_tensors(on_new_tensor_cb, n_threads, enable_mmap, filter_func);
+    if (!success) {
+        return false;
+    }
+
+    bool missing = false;
+    for (auto& pair : target_tensors) {
+        if (loaded_names.find(pair.first) == loaded_names.end()) {
+            LOG_ERROR("Requested tensor '%s' not found in file", pair.first.c_str());
+            missing = true;
+        }
+    }
+
+    return !missing;
 }
 
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {

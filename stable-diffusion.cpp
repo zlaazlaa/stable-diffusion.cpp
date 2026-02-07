@@ -134,7 +134,11 @@ public:
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
 
-    std::map<std::string, struct ggml_tensor*> tensors;
+    ModelLoader model_loader;
+    bool enable_mmap = false;
+
+    std::map<std::string, ggml_tensor*> tensors;
+    std::map<std::string, std::map<std::string, ggml_tensor*>> tensors_split;
 
     // lora_name => multiplier
     std::unordered_map<std::string, float> curr_lora_state;
@@ -207,6 +211,16 @@ public:
         backend = ggml_backend_sycl_init(0);
 #endif
 
+#ifdef SD_USE_HTP
+        LOG_DEBUG("Using HTP backend");
+        auto* htp_reg = ggml_backend_htp_reg();
+        auto* htp_dev = ggml_backend_reg_dev_get(htp_reg, 0);
+        backend       = ggml_backend_dev_init(htp_dev, nullptr);
+        if (!backend) {
+            LOG_WARN("Failed to initialize HTP backend");
+        }
+#endif
+
         if (!backend) {
             LOG_DEBUG("Using CPU backend");
             backend = ggml_backend_cpu_init();
@@ -223,6 +237,19 @@ public:
         }
     }
 
+    bool load_parameters(std::string module_name) {
+        if (module_name == "alphas_cumprod") {
+            return true;
+        }
+        LOG_DEBUG("loading module '%s' tensors", module_name.c_str());
+        bool success = model_loader.load_tensors_subset(tensors_split[module_name], n_threads, enable_mmap);
+        if (!success) {
+            LOG_ERROR("load tensors from model loader failed");
+            return false;
+        }
+        return true;
+    }
+
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads               = sd_ctx_params->n_threads;
         vae_decode_only         = sd_ctx_params->vae_decode_only;
@@ -230,6 +257,7 @@ public:
         taesd_path              = SAFE_STR(sd_ctx_params->taesd_path);
         use_tiny_autoencoder    = taesd_path.size() > 0;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
+        enable_mmap             = sd_ctx_params->enable_mmap;
 
         rng = get_rng(sd_ctx_params->rng_type);
         if (sd_ctx_params->sampler_rng_type != RNG_TYPE_COUNT && sd_ctx_params->sampler_rng_type != sd_ctx_params->rng_type) {
@@ -241,8 +269,6 @@ public:
         ggml_log_set(ggml_log_callback_default, nullptr);
 
         init_backend();
-
-        ModelLoader model_loader;
 
         if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
             LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
@@ -327,7 +353,16 @@ public:
             return false;
         }
 
-        auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+        auto& tensor_storage_map                    = model_loader.get_tensor_storage_map();
+        String2TensorStorage tmp_tensor_storage_map = {};
+
+        for (auto& [name, tensor_storage] : tensor_storage_map) {
+            // Temporarily block the T5 model
+            if (name.find("text_encoders.t5xxl") == std::string::npos) {
+                tmp_tensor_storage_map.insert({name, tensor_storage});
+            }
+        }
+        tensor_storage_map.swap(tmp_tensor_storage_map);
 
         LOG_INFO("Version: %s ", model_version_to_str[version]);
         ggml_type wtype               = (int)sd_ctx_params->wtype < std::min<int>(SD_TYPE_COUNT, GGML_TYPE_COUNT)
@@ -503,7 +538,7 @@ public:
                                                                              offload_params_to_cpu,
                                                                              tensor_storage_map);
                     clip_vision->alloc_params_buffer();
-                    clip_vision->get_param_tensors(tensors);
+                    clip_vision->get_param_tensors(tensors_split["clip_vision"]);
                 }
             } else if (sd_version_is_qwen_image(version)) {
                 bool enable_vision = false;
@@ -569,19 +604,13 @@ public:
                 }
             }
 
-            cond_stage_model->alloc_params_buffer();
-            cond_stage_model->get_param_tensors(tensors);
-
-            diffusion_model->alloc_params_buffer();
-            diffusion_model->get_param_tensors(tensors);
-
             if (sd_version_is_unet_edit(version)) {
                 vae_decode_only = false;
             }
 
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->alloc_params_buffer();
-                high_noise_diffusion_model->get_param_tensors(tensors);
+                high_noise_diffusion_model->get_param_tensors(tensors_split["high_noise_diffusion_model"]);
             }
 
             if (sd_ctx_params->keep_vae_on_cpu && !ggml_backend_is_cpu(backend)) {
@@ -600,7 +629,7 @@ public:
                                                                             vae_decode_only,
                                                                             version);
                     first_stage_model->alloc_params_buffer();
-                    first_stage_model->get_param_tensors(tensors, "first_stage_model");
+                    first_stage_model->get_param_tensors(tensors_split["first_stage_model"], "first_stage_model");
                 } else if (version == VERSION_CHROMA_RADIANCE) {
                     first_stage_model = std::make_shared<FakeVAE>(vae_backend,
                                                                   offload_params_to_cpu);
@@ -626,7 +655,7 @@ public:
                         first_stage_model->set_conv2d_scale(vae_conv_2d_scale);
                     }
                     first_stage_model->alloc_params_buffer();
-                    first_stage_model->get_param_tensors(tensors, "first_stage_model");
+                    first_stage_model->get_param_tensors(tensors_split["first_stage_model"], "first_stage_model");
                 }
             }
 
@@ -709,7 +738,7 @@ public:
                     LOG_ERROR(" pmid model params buffer allocation failed");
                     return false;
                 }
-                pmid_model->get_param_tensors(tensors, "pmid");
+                pmid_model->get_param_tensors(tensors_split["pmid"], "pmid");
             }
 
             diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
@@ -740,37 +769,15 @@ public:
         // load weights
         LOG_DEBUG("loading weights");
 
-        std::set<std::string> ignore_tensors;
-        tensors["alphas_cumprod"] = alphas_cumprod_tensor;
-        if (use_tiny_autoencoder) {
-            ignore_tensors.insert("first_stage_model.");
-        }
-        if (use_pmid) {
-            ignore_tensors.insert("pmid.unet.");
-        }
-        ignore_tensors.insert("model.diffusion_model.__x0__");
-        ignore_tensors.insert("model.diffusion_model.__32x32__");
-        ignore_tensors.insert("model.diffusion_model.__index_timestep_zero__");
+        cond_stage_model->get_param_tensors(tensors_split["cond_stage_model"]);
+        diffusion_model->get_param_tensors(tensors_split["diffusion_model"]);
 
-        if (vae_decode_only) {
-            ignore_tensors.insert("first_stage_model.encoder");
-            ignore_tensors.insert("first_stage_model.conv1");
-            ignore_tensors.insert("first_stage_model.quant");
-            ignore_tensors.insert("text_encoders.llm.visual.");
-        }
-        if (version == VERSION_OVIS_IMAGE) {
-            ignore_tensors.insert("text_encoders.llm.vision_model.");
-            ignore_tensors.insert("text_encoders.llm.visual_tokenizer.");
-            ignore_tensors.insert("text_encoders.llm.vte.");
-        }
-        if (version == VERSION_SVD) {
-            ignore_tensors.insert("conditioner.embedders.3");
-        }
-        bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
-        if (!success) {
-            LOG_ERROR("load tensors from model loader failed");
-            ggml_free(ctx);
-            return false;
+        tensors_split["alphas_cumprod"]["alphas_cumprod"] = alphas_cumprod_tensor;
+
+        for (auto& group : tensors_split) {
+            for (auto& item : group.second) {
+                tensors[item.first] = item.second;
+            }
         }
 
         LOG_DEBUG("finished loaded file");
@@ -3208,6 +3215,10 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     // Photo Maker
     SDCondition id_cond = sd_ctx->sd->get_pmid_conditon(work_ctx, pm_params, condition_params);
 
+    // Load cond_stage_model parameters into memory
+    sd_ctx->sd->cond_stage_model->alloc_params_buffer();
+    sd_ctx->sd->load_parameters("cond_stage_model");
+
     // Get learned condition
     condition_params.zero_out_masked = false;
     SDCondition cond                 = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
@@ -3233,6 +3244,10 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
+
+    // Load diffusion_model parameters into memory
+    sd_ctx->sd->diffusion_model->alloc_params_buffer();
+    sd_ctx->sd->load_parameters("diffusion_model");
 
     // Control net hint
     struct ggml_tensor* image_hint = nullptr;
@@ -3393,6 +3408,10 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     }
     int64_t t3 = ggml_time_ms();
     LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs", final_latents.size(), (t3 - t1) * 1.0f / 1000);
+
+    // Load first_stage_model parameters into memory
+    // sd_ctx->sd->first_stage_model->alloc_params_buffer();
+    sd_ctx->sd->load_parameters("first_stage_model");
 
     // Decode to image
     LOG_INFO("decoding %zu latents", final_latents.size());
